@@ -1,0 +1,1 @@
+org=YOUR_ORG; gh api --paginate "/orgs/$org/packages?package_type=container&per_page=100" --jq '.[].name' | while IFS= read -r pkg; do gh api --paginate "/orgs/$org/packages/container/${pkg//\//%2F}/versions?per_page=100" | jq -r --arg pkg "$pkg" '.[] | .metadata.container.tags[]? | "\($pkg):\(.)"'; done
