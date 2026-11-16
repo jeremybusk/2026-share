@@ -6,6 +6,7 @@ Examples (from the project root):
   python3 modernize.py --profile js --profile react19 --target src --diff
   python3 modernize.py --profile express5 --target packages/api --apply
   python3 modernize.py --upgrade stable --diff
+  python3 modernize.py --upgrade stable --npm-registry https://npm.corp.example/repository/npm/
   python3 modernize.py --upgrade lts --lts-fallback stable --apply
 
 Source migrations use pinned upstream revisions and npm tools in a private cache.
@@ -24,6 +25,12 @@ tags and compound ranges are reported and preserved. All four dependency
 sections are checked, including peers. No dependency floor is downgraded.
 Scans omit symlinks, nested Git checkouts, dependencies, common generated
 directories, the tool cache and --exclude-dir entries.
+
+--npm-registry routes npm metadata and tool installs, including configured scopes,
+through one mirror. Use ~/.npmrc or NPM_CONFIG_USERCONFIG for host/path-scoped
+credentials so temporary installs can use them. Git-backed profiles also use
+--git-base-url, with mirror paths <base>/<owner>/<repo>.git. An internal-only
+runner needs internal tarball/redirect destinations and an egress allowlist.
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 # Keep the public inventory and the execution plan together. Each step specifies
@@ -212,6 +220,32 @@ def run(args, cwd, *, capture=False):
     return result.stdout
 
 
+def registry_url(value):
+    try:
+        parsed = urlsplit(value)
+        valid = (parsed.scheme in ('https', 'http') and parsed.hostname and parsed.port != 0
+                 and parsed.username is None and parsed.password is None and not parsed.query
+                 and not parsed.fragment and not any(c.isspace() for c in value))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise argparse.ArgumentTypeError('use an HTTP(S) registry URL without credentials, query, or fragment')
+    return value.rstrip('/') + '/'
+
+
+def npm_flags(registry, cwd):
+    if not registry:
+        return ()
+    # A project, user or global .npmrc may route individual scopes elsewhere.
+    # Read npm's effective keys in the exact directory the next command will use.
+    # Keep config output private and pass only registry options to child processes.
+    config = json.loads(run(['npm', 'config', 'list', '--json', '--workspaces=false',
+                             '--update-notifier=false'], cwd, capture=True))
+    scopes = sorted(k for k in config if k.startswith('@') and k.endswith(':registry'))
+    return (f'--registry={registry}', '--replace-registry-host=always', '--update-notifier=false',
+            *(f'--{key}={registry}' for key in scopes))
+
+
 def cached_tree(dest, populate):
     if not dest.is_dir():
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -227,7 +261,10 @@ def cached_tree(dest, populate):
     return dest
 
 
-def prepare_steps(steps, cache, base_url):
+def prepare_steps(steps, cache, base_url, registry=None):
+    if registry:
+        # The React checkout contains an npm-installed helper as well as Git files.
+        cache = cache / 'registries' / hashlib.sha256(registry.encode()).hexdigest()[:20]
     packages = set()
     repos = {}
     for step in steps:
@@ -245,7 +282,8 @@ def prepare_steps(steps, cache, base_url):
                     with tempfile.TemporaryDirectory() as tmp:
                         prefix = Path(tmp)
                         (prefix / 'package.json').write_text('{"private":true}', encoding='utf-8')
-                        run(['npm', 'install', '--ignore-scripts', '--no-fund', '--no-audit', '@jssg/utils@0.0.10'], prefix)
+                        run(['npm', 'install', '--ignore-scripts', '--no-fund', '--no-audit', '@jssg/utils@0.0.10',
+                             *npm_flags(registry, prefix)], prefix)
                         shutil.copytree(prefix / 'node_modules', dst / 'node_modules')
                     for item in PROFILES['react19'][1]:
                         if item.runner == 'react':
@@ -272,7 +310,8 @@ def prepare_steps(steps, cache, base_url):
     key = hashlib.sha256((json.dumps(pins) + platform + ESLINT_CONFIG + CLEANUP_RENDER + NEXT_OG).encode()).hexdigest()[:20]
     def install(dst):
         (dst / 'package.json').write_text(json.dumps({'private': True, 'dependencies': pins}), encoding='utf-8')
-        run(['npm', 'install', '--ignore-scripts', '--no-fund', '--no-audit', '--workspaces=false'], dst)
+        run(['npm', 'install', '--ignore-scripts', '--no-fund', '--no-audit', '--workspaces=false',
+             *npm_flags(registry, dst)], dst)
         (dst / 'next-og.cjs').write_text(NEXT_OG, encoding='utf-8')
         (dst / 'cleanup-render.cjs').write_text(CLEANUP_RENDER, encoding='utf-8')
         (dst / 'eslint.config.mjs').write_text(ESLINT_CONFIG, encoding='utf-8')
@@ -307,12 +346,12 @@ class Change:
     after: bytes
 
 
-def source_changes(root, target, excluded, steps, cache, base_url):
+def source_changes(root, target, excluded, steps, cache, base_url, registry=None):
     originals = {p.relative_to(target): p.read_bytes() for p in file_tree(target, excluded, cache)
                  if p.suffix[1:] in EXTENSIONS}
     if not originals:
         raise Problem(f'No JS/TS source files found in {target}')
-    tools, paths = prepare_steps(steps, cache, base_url)
+    tools, paths = prepare_steps(steps, cache, base_url, registry)
     modules = tools / 'node_modules'
     suffixes = {p.suffix[1:] for p in originals}
     print(f'Staging {len(originals)} source file(s) under {target}', flush=True)
@@ -428,9 +467,9 @@ def version_key(version):
     return tuple(map(int, match.groups())) if match else None
 
 
-def registry_info(package, root):
+def registry_info(package, root, *flags):
     out = run(['npm', 'view', package, 'dist-tags', 'versions', '--json', '--workspaces=false',
-               '--prefer-online', '--fetch-retries=1', '--fetch-timeout=30000'], root, capture=True)
+               '--prefer-online', '--fetch-retries=1', '--fetch-timeout=30000', *flags], root, capture=True)
     data = json.loads(out)
     if not isinstance(data, dict) or not isinstance(data.get('dist-tags'), dict):
         raise Problem(f'Unexpected registry metadata for {package}')
@@ -489,7 +528,7 @@ def replace_spec(spec, version):
     return operator + v + '.'.join(numeric[i] if p.isdigit() else p for i, p in enumerate(parts))
 
 
-def manifest_changes(root, excluded, channel, fallback, jobs, cache):
+def manifest_changes(root, excluded, channel, fallback, jobs, cache, registry=None):
     manifests = [load_manifest(p) for p in file_tree(root, excluded, cache) if p.name == 'package.json']
     if not manifests:
         raise Problem(f'No package.json files found under {root}')
@@ -501,8 +540,9 @@ def manifest_changes(root, excluded, channel, fallback, jobs, cache):
             if source:
                 names.add(source[0])
     print(f'Checking {len(names)} registry package(s) across {len(manifests)} manifest(s)', flush=True)
+    flags = npm_flags(registry, root) if names else ()
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-        pending = {name: pool.submit(registry_info, name, root) for name in sorted(names)}
+        pending = {name: pool.submit(registry_info, name, root, *flags) for name in sorted(names)}
         versions = {name: select_version(job.result(), channel, fallback) for name, job in pending.items()}
     changes = []
     for m in manifests:
@@ -588,6 +628,9 @@ def arguments():
     p.add_argument('--exclude-dir', action='append', default=[], metavar='NAME', help='extra directory basename to exclude; repeatable')
     p.add_argument('--cache-dir', type=Path, default=Path(os.getenv('XDG_CACHE_HOME') or Path.home() / '.cache') / 'js-modernize',
                    help='dedicated source/tool cache (excluded from scans)')
+    p.add_argument('--npm-registry', '--registry', metavar='URL', type=registry_url,
+                   default=os.getenv('MODERNIZE_NPM_REGISTRY') or None,
+                   help='single npm registry for lookups, tool installs and all scopes (env: MODERNIZE_NPM_REGISTRY)')
     p.add_argument('--git-base-url', default=os.getenv('GIT_BASE_URL', 'https://github.com'), help='Git host or mirror base URL')
     p.add_argument('--apply', action='store_true', help='write changes after every selected step succeeds (default: preview)')
     p.add_argument('--diff', action='store_true', help='print unified diffs')
@@ -621,7 +664,7 @@ def main():
     if cache == root:
         raise Problem('Choose a dedicated cache directory, distinct from --root')
     if args.upgrade:
-        changes.extend(manifest_changes(root, excluded, args.upgrade, args.lts_fallback, args.jobs, cache))
+        changes.extend(manifest_changes(root, excluded, args.upgrade, args.lts_fallback, args.jobs, cache, args.npm_registry))
     if args.profile:
         target = (root / args.target).resolve(strict=True)
         if not target.is_dir() or not target.is_relative_to(root):
@@ -629,7 +672,7 @@ def main():
         if target.is_relative_to(cache):
             raise Problem('--target must be outside the tool cache')
         steps = [s for name in dict.fromkeys(args.profile) for s in PROFILES[name][1]]
-        changes.extend(source_changes(root, target, excluded, steps, cache, args.git_base_url))
+        changes.extend(source_changes(root, target, excluded, steps, cache, args.git_base_url, args.npm_registry))
     for c in changes:
         rel = c.path.relative_to(root).as_posix()
         print(f'  changed  {rel}')
